@@ -1,0 +1,1 @@
+datatype bool = FALSE | TRUE
