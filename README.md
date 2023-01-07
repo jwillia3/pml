@@ -24,6 +24,16 @@
                 '!' atexpr
                 '(' expr,... ')'
                 '[' expr,... ']'
-                '\' lamrules
+                'fn' lamrules
     lamrules:   atexpr... '->' expr ['or' lamrules]
 ```
+
+# NOTES
+- This translates surface syntax into an enriched lambda calculus
+- Types are checked from the surface syntax
+- Lambda calculus is untyped
+- Translating compiling patterns proved difficult
+  - Augustsson (1985) works but involves a lot of code and backtracking
+  - Peyton Jones, Wadler (1987)
+- Ultimately, this is postponed evaluating the worth of functional
+  languages in general

@@ -33,6 +33,7 @@ struct Expr {
         struct { Expr *lhs, *rhs, *in; } let;
         struct { List *rules; Expr *in; } rec;
         struct { Expr *lhs, *rhs; } seq;
+        struct { String *subject, *tag; List *vars; Expr *body, *fail; } test;
         Expr *deref;
     };
 };
@@ -126,16 +127,18 @@ void *fatal(Pos pos, char *msg, ...) {
     puts("");
     exit(1);
 }
-
-bool open_src(char *path) {
+void set_src(char *name, char *text) {
     src = line_start = source;
     peeked = false;
-    srcpos = (Pos) {intern(path, -1), 1, 1};
+    srcpos = (Pos) {intern(name, -1), 1, 1};
+    memmove(source, text, strlen(text) + 1);
+}
+bool open_src(char *path) {
     FILE *file = fopen(path, "rb");
-    if (!file) return false;
+    if (!file) return set_src(path, ""), false;
     fread(source, 1, sizeof source, file);
     fclose(file);
-    return true;
+    return set_src(path, source), true;
 }
 
 int character(void) {
@@ -552,7 +555,7 @@ Type *tc(Expr *e, Static *env) {
                     return t;
     case EFN:       t = typevar(0);
                     EACH(e->fn.rules) {
-                        FnRule *f = i->fn_rule;
+                        FnRule  *f = i->fn_rule;
                         Static  *local = env;
                         List    *signature = 0;
                         EACH(f->params) append(&signature, tc_pat(i->expr, &local));
@@ -615,12 +618,13 @@ typedef struct Value Value;
 typedef struct LC LC;
 typedef struct Dynamic Dynamic;
 struct Value {
-    enum { INT, CHAR, STRING, DATA, FN } form;
+    enum { INT, CHAR, STRING, DATA, FN, PRIM } form;
     union {
         int         n;
         String      *str;
         struct Data *data;
         struct Fn   *fn;
+        int         prim;
     };
 };
 typedef struct Data { String *tag; int n; Value xs[]; } Data;
@@ -628,25 +632,54 @@ typedef struct Fn { LC *body; Dynamic *env; } Fn;
 struct Dynamic { Value value; Dynamic *next; };
 #define Dynamic(VALUE, NEXT) new(Dynamic, VALUE, NEXT)
 
+typedef enum {
+    PADD, PSUB, PMUL, PDIV, PREM, PEQUAL, PNOTEQUAL,
+} Prim;
+struct prim_spec { char *id, *sig; } prim_spec[] = {
+    {"+", "int->int->int"},
+    {"-", "int->int->int"},
+    {"*", "int->int->int"},
+    {"/", "int->int->int"},
+    {"rem", "int->int->int"},
+    {"==", "a -> a -> bool"},
+    {"<>", "a -> a -> bool"},
+    {0, 0}
+};
+
+bool equal(Value a, Value b) {
+    switch (a.form) {
+    case INT:   return a.n == b.n;
+    case CHAR:  return a.n == b.n;
+    case STRING: if (a.str == b.str) return true;
+                if (a.str->len != b.str->len) return false;
+                return !memcmp(a.str->chars, b.str->chars, a.str->len);
+    case DATA:  if (a.data->tag != b.data->tag) return false;
+                for (int i = 0; i < a.data->n; i++)
+                    if (!equal(a.data->xs[i], b.data->xs[i])) return false;
+                return true;
+    case FN:    return a.fn == b.fn;
+    case PRIM:  return a.prim == b.prim;
+    }
+}
+
 struct LC {
-    enum { LLIT, LVAR, LTUPLE, LFN, LAPP, LIF, LCASE, LLET, LREC, LSEQ  } form;
+    enum { LLIT, LVAR, LTUPLE, LFN, LAPP, LIF, LLET, LREC, LSEQ  } form;
     Pos pos;
     union {
         Value   lit;
         int     index;
         struct { int n; LC **xs; } tuple;
-        struct { int n; LC *body; } fn;
+        struct { LC *body; } fn;
         struct { LC *f; int n; LC **args; } app;
         struct { LC *a, *b, *c; } _if;
-        struct { LC *subject; int n; LC *cond, *body; } _case;
         struct { LC *value, *in; } let;
-        struct { List *rules; LC *in; } rec;
+        struct { int n; LC **bodies, *in; } rec;
         struct { LC *lhs, *rhs; } seq;
     };
 };
 #define LC(FORM, POS, ...) new(LC, FORM, .pos=POS, __VA_ARGS__)
 
-Value   unit, nil, list_con;
+Value   unit, nil, list_con, _true, _false;
 
 Value the_int(int n) { return (Value) {INT, .n=n}; }
 Value the_char(int n) { return (Value) {CHAR, .n=n}; }
@@ -661,6 +694,7 @@ Value the_data(String *tag, int n, Value *xs) {
 Value the_fn(LC *body, Dynamic *env) {
     return (Value) {FN, .fn=new(Fn, body, env)};
 }
+Value the_prim(int prim) { return (Value) {PRIM, .prim=prim}; }
 void pv(Value x) {
     switch (x.form) {
     case INT:   printf("%d", x.n); break;
@@ -671,7 +705,7 @@ void pv(Value x) {
                     for (int i = 0; i < x.data->n; i++)
                         fputs(i? ", ": "", stdout), pv(x.data->xs[i]);
                     putchar(')');
-                } else if (x.data->tag == list_tag) {
+                } else if (x.data->tag == list_tag && x.data->n) {
                     putchar('[');
                     for (int i=0; x.data->tag == list_tag; x=x.data->xs[1], i++)
                         fputs(i? ", ": "", stdout), pv(x.data->xs[0]);
@@ -685,19 +719,36 @@ void pv(Value x) {
                 } else fputs(x.data->tag->chars, stdout);
                 break;
     case FN:    fputs("#fn", stdout); break;
+    case PRIM:  fputs(prim_spec[x.prim].id, stdout); break;
     }
 }
+LC *lc(Expr *e, Static *env);
 LC *lit(Pos pos, Value x) { return LC(LLIT, pos, .lit=x); }
+LC *lc_fn(Expr *e, Static *env) {
+    if (count(e->fn.rules) == 1) {
+        List    *params = e->fn.rules->fn_rule->params;
+        bool    simple = e->fn.rules->fn_rule->guard == 0;
+        EACH(params) simple &= i->expr->form == EVAR;
+        if (simple) {
+            EACH(params) env = Static(i->expr->id, 0, env);
+            return LC(LFN, e->pos, .fn={lc(e->fn.rules->fn_rule->body, env)});
+        }
+    }
+    fatal(e->pos, "UNHANDLED LC_FN");
+}
+int debruijn(String *id, Static *env) {
+    return env->id == id? 0: 1 + debruijn(id, env->next);
+}
 LC *lc(Expr *e, Static *env) {
-    LC  **xs, *a, *b, *c, *f;
-    int n=0;
+    LC      **xs, *a, *b, *c, *f;
+    Expr    *fail = 0;
+    int     n = 0;
     switch (e->form) {
     case EINT:      return lit(e->pos, the_int(e->n));
     case ECHAR:     return lit(e->pos, the_char(e->n));
     case ESTRING:   return lit(e->pos, the_str(e->str));
     case ECON:      return lit(e->pos, the_data(e->id, 0, 0));
-    case EVAR:      for (Static *i = env; i->id != e->id; i = i->next) n++;
-                    return LC(LVAR, e->pos, .index=n);
+    case EVAR:      return LC(LVAR, e->pos, .index=debruijn(e->id, env));
     case ETUPLE:    if (!e->tuple) return lit(e->pos, unit);
                     xs = malloc(count(e->tuple) * sizeof *xs);
                     EACH(e->tuple) xs[n++] = lc(i->expr, env);
@@ -710,7 +761,7 @@ LC *lc(Expr *e, Static *env) {
                         xs[1] = c,
                         c = LC(LAPP, xs[0]->pos, .app={f, 2, xs});
                     return c;
-    // case EFN:
+    case EFN:       return lc_fn(e, env);
     case EAPP:      xs = malloc(count(e->app.args) * sizeof *xs);
                     f = lc(e->app.f, env);
                     EACH(e->app.args) xs[n++] = lc(i->expr, env);
@@ -726,7 +777,11 @@ LC *lc(Expr *e, Static *env) {
                         return LC(LLET, e->pos, .let={value, in});
                     }
                     goto untranslated;
-    // case EREC:
+    case EREC:      xs = malloc(count(e->rec.rules) * sizeof *xs);
+                    EACH(e->rec.rules) env = Static(i->rule->lhs->id, 0, env);
+                    EACH(e->rec.rules) xs[n++] = lc(i->rule->rhs, env)->fn.body;
+                    c = lc(e->rec.in, env);
+                    return LC(LREC, e->pos, .rec={n, xs, c});
     case ESEQ:      return LC(LSEQ, e->pos, .seq={lc(e->seq.lhs, env),
                                                   lc(e->seq.rhs, env)});
     // case EDEREF:
@@ -734,7 +789,8 @@ LC *lc(Expr *e, Static *env) {
     untranslated: fatal(e->pos, "UNTRANSLATED EXPRESSION");
 }
 Value eval(LC *c, Dynamic *env) {
-    Value   *xs, f;
+    Value   *xs, f, x;
+    Dynamic *old;
     top:
     switch (c->form) {
     case LLIT:  return c->lit;
@@ -744,70 +800,102 @@ Value eval(LC *c, Dynamic *env) {
                     for (int i = 0; i < c->tuple.n; i++)
                         xs[i] = eval(c->tuple.xs[i], env);
                     return the_data(tuple_tag, c->tuple.n, xs);
-    // case LFN:
+    case LFN:       return the_fn(c->fn.body, env);
     case LAPP:      f = eval(c->app.f, env);
-                    if (f.form == DATA) {
+                    if (f.form == PRIM) {
+                        Value   x[4];
+                        for (int i = 0; i < c->app.n; i++)
+                            x[i] = eval(c->app.args[i], env);
+                        switch (f.prim) {
+                        case PADD:      return the_int(x[0].n + x[1].n);
+                        case PSUB:      return the_int(x[0].n - x[1].n);
+                        case PMUL:      return the_int(x[0].n * x[1].n);
+                        case PDIV:      return the_int(x[0].n / x[1].n);
+                        case PREM:      return the_int(x[0].n % x[1].n);
+                        case PEQUAL:    return equal(x[0], x[1])? _true: _false;
+                        case PNOTEQUAL: return equal(x[0], x[1])? _false: _true;
+                        }
+                    } else if (f.form == DATA) {
                         Value out = the_data(f.data->tag, c->app.n, 0);
                         for (int i = 0; i < c->app.n; i++)
                             out.data->xs[i] = eval(c->app.args[i], env);
                         return out;
-                    } else goto unevaluated;
+                    }
+                    old = env;
+                    env = f.fn->env;
+                    for (int i = 0; i < c->app.n; i++)
+                        env = Dynamic(eval(c->app.args[i], old), env);
+                    c = f.fn->body;
+                    goto top;
     case LIF:       c = eval(c->_if.a, env).data->tag == true_tag
                             ? c->_if.b
                             : c->_if.c;
                     goto top;
-    // case LCASE:
     case LLET:      env = Dynamic(eval(c->let.value, env), env);
                     c = c->let.in;
                     goto top;
-    // case LREC:
+    case LREC:      old = env;
+                    for (int i = 0; i < c->rec.n; i++)
+                        env = Dynamic(the_fn(c->rec.bodies[i], env), env);
+                    for (Dynamic *i = env; i != old; i = i->next)
+                        i->value.fn->env = env;
+                    c = c->rec.in;
+                    goto top;
     case LSEQ:  eval(c->seq.lhs, env); c = c->seq.rhs; goto top;
     }
     unevaluated: fatal(c->pos, "UNEVALUATED EXPRESSION");
 }
-
-void inititalize(void) {
+Type *parse_type(char *spec) {
+    push(&all_types, typevar(intern("a", -1)));
+    Type *out = (set_src("", spec), type());
+    pop(&all_types);
+    return out;
+}
+void inititalize(Static **senv, Dynamic **denv) {
     wildcard = intern("_", 1);
-    bool_type = basic(intern("bool", -1), 0);
-    int_type = basic(intern("int", -1), 0);
-    char_type = basic(intern("char", -1), 0);
-    string_type = basic(intern("string", -1), 0);
+    Type *a = typevar(intern("a", -1));
+    push(&all_types, bool_type = basic(intern("bool", -1), 0));
+    push(&all_types, int_type = basic(intern("int", -1), 0));
+    push(&all_types, char_type = basic(intern("char", -1), 0));
+    push(&all_types, string_type = basic(intern("string", -1), 0));
+    push(&all_types, list_type = basic(intern("list", -1), List(a, 0)));
+    push(&all_types, ref_type = basic(intern("ref", -1), List(a, 0)));
     unit_type = tuple_type(0);
-    list_type = basic(intern("list", -1), List(typevar(0), 0));
-    ref_type = basic(intern("ref", -1), List(typevar(0), 0));
     true_tag = intern("TRUE", -1);
     ref_tag = intern("REF", -1);
     tuple_tag = intern("!TUPLE", -1);
     list_tag = intern(":", -1);
-    push(&all_types, bool_type);
-    push(&all_types, int_type);
-    push(&all_types, char_type);
-    push(&all_types, string_type);
-    push(&all_types, list_type);
     push(&all_cons, Con(true_tag, bool_type));
     push(&all_cons, Con(intern("FALSE", -1), bool_type));
-    push(&all_cons, Con(list_tag, fn_type(List(list_type->args->type, List(list_type, List(list_type, 0))))));
+    push(&all_cons, Con(list_tag, parse_type("a -> a list -> a list")));
     push(&all_cons, Con(intern("[]", -1), list_type));
-    push(&all_cons, Con(ref_tag, fn_type(List(ref_type->args->type, List(ref_type, 0)))));
+    push(&all_cons, Con(ref_tag, parse_type("a -> a ref")));
     unit = the_data(tuple_tag, 0, 0);
     nil = the_data(intern("[]", -1), 0, 0);
     list_con = the_data(list_tag, 0, 0);
+    _true = the_data(true_tag, 0, 0);
+    _false = the_data(intern("FALSE", -1), 0, 0);
+    for (struct prim_spec *i = prim_spec; i->id; i++)
+        *senv = Static(intern(i->id, -1), parse_type(i->sig), *senv),
+        *denv = Dynamic(the_prim(i - prim_spec), *denv);
 }
 int main(int argc, char **argv) {
-    inititalize();
+    Static  *senv = 0;
+    Dynamic *denv = 0;
+    inititalize(&senv, &denv);
     if (!open_src(argv[1]))
         fatal(srcpos, "cannot open source");
     header();
     Expr *e = expr();
-    Type *t = tc(e, 0);
+    Type *t = tc(e, senv);
 
     char buf[1024];
     int unique = 0;
     rename_typevars(t, &unique);
     printf(":: %s\n", wt(buf, t, true));
 
-    LC *c = lc(e, 0);
-    Value result = eval(c, 0);
+    LC *c = lc(e, senv);
+    Value result = eval(c, denv);
     pv(result), puts("");
     puts("done.");
 }
